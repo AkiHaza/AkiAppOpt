@@ -16,7 +16,7 @@
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
-#define VERSION            "1.6.4"
+#define VERSION            "1.6.5"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -343,6 +343,7 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
     size_t rules_cnt = 0;
     size_t fail_cnt = 0;
     char cur_pkg[MAX_PKG_LEN] = {0};
+    char pending_pkg[MAX_PKG_LEN] = {0};
     bool in_block = false;
 
     char* save;
@@ -353,45 +354,102 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
         if (!*p || *p == '#' || (p[0] == '/' && p[1] == '/')) continue;
 
         if (in_block) {
-            if (*p == '}') {
+            bool block_end = false;
+            char* close_br = strchr(p, '}');
+            if (close_br) {
+                *close_br = 0;
+                block_end = true;
+            }
+            char* content = strtrim(p);
+            if (*content) {
+                char* eq = strchr(content, '=');
+                if (eq) {
+                    *eq++ = 0;
+                    if (!add_rule(&new_rules, &rules_cnt, &cfg->topo, cur_pkg, strtrim(content), strtrim(eq))) fail_cnt++;
+                } else {
+                    fail_cnt++;
+                }
+            }
+            if (block_end) {
                 in_block = false;
                 cur_pkg[0] = '\0';
-                continue;
             }
-            char* eq = strchr(p, '=');
-            if (!eq) continue;
-            *eq++ = 0;
-            if (!add_rule(&new_rules, &rules_cnt, &cfg->topo, cur_pkg, strtrim(p), strtrim(eq))) fail_cnt++;
             continue;
         }
 
-        char* eq = strchr(p, '=');
-        if (!eq) continue;
-        *eq++ = 0;
-
-        char* br = strchr(p, '{');
-        char* thread = "";
-        if (br) {
-            *br++ = 0;
-            char* eb = strchr(br, '}');
-            if (!eb) continue;
-            *eb = 0;
-            thread = strtrim(br);
+        char* sep = strpbrk(p, "={");
+        if (!sep) {
+            if (pending_pkg[0]) fail_cnt++;
+            pending_pkg[0] = '\0';
+            continue;
         }
 
-        char* pkg = strtrim(p);
-        char* cpus = strtrim(eq);
-
-        char* block_br = strchr(cpus, '{');
-        if (block_br) {
-            *block_br = 0;
-            cpus = strtrim(cpus);
+        if (*sep == '{') {
+            *sep++ = 0;
+            char* pkg = strtrim(p);
+            char* eb = strchr(sep, '}');
+            if (eb) {
+                if (pending_pkg[0]) { fail_cnt++; pending_pkg[0] = '\0'; }
+                *eb = 0;
+                char* thread = strtrim(sep);
+                char* eq = strchr(eb + 1, '=');
+                if (!eq) { fail_cnt++; continue; }
+                *eq++ = 0;
+                char* cpus = strtrim(eq);
+                char* tail_br = strchr(cpus, '{');
+                if (tail_br) {
+                    *tail_br = 0;
+                    char* cpus_only = strtrim(cpus);
+                    if (*cpus_only) {
+                        if (!add_rule(&new_rules, &rules_cnt, &cfg->topo, pkg, thread, cpus_only)) fail_cnt++;
+                    }
+                    build_str(cur_pkg, sizeof(cur_pkg), pkg, NULL);
+                    in_block = true;
+                    continue;
+                }
+                if (!add_rule(&new_rules, &rules_cnt, &cfg->topo, pkg, thread, cpus)) fail_cnt++;
+                continue;
+            }
+            const char* blk_pkg;
+            if (*pkg) {
+                if (pending_pkg[0]) fail_cnt++;
+                blk_pkg = pkg;
+            } else {
+                blk_pkg = pending_pkg;
+            }
+            if (!*blk_pkg) { fail_cnt++; continue; }
+            build_str(cur_pkg, sizeof(cur_pkg), blk_pkg, NULL);
+            pending_pkg[0] = '\0';
             in_block = true;
-            build_str(cur_pkg, sizeof(cur_pkg), pkg, NULL);
+            continue;
         }
 
-        if (!add_rule(&new_rules, &rules_cnt, &cfg->topo, pkg, thread, cpus)) fail_cnt++;
+        if (pending_pkg[0]) fail_cnt++;
+        *sep++ = 0;
+        char* pkg = strtrim(p);
+        char* br = strchr(sep, '{');
+        if (br) {
+            *br = 0;
+            char* cpus = strtrim(sep);
+            build_str(cur_pkg, sizeof(cur_pkg), pkg, NULL);
+            in_block = true;
+            if (*cpus) {
+                if (!add_rule(&new_rules, &rules_cnt, &cfg->topo, pkg, "", cpus)) fail_cnt++;
+            }
+            pending_pkg[0] = '\0';
+            continue;
+        }
+
+        char* cpus = strtrim(sep);
+        if (!*cpus) {
+            build_str(pending_pkg, sizeof(pending_pkg), pkg, NULL);
+            continue;
+        }
+        if (!add_rule(&new_rules, &rules_cnt, &cfg->topo, pkg, "", cpus)) fail_cnt++;
+        pending_pkg[0] = '\0';
     }
+
+    if (in_block || pending_pkg[0]) fail_cnt++;
 
     if (last_mtime) *last_mtime = st.st_mtime;
     size_t pkgs_cnt = 0;
@@ -403,6 +461,7 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
 
     free(config_buf);
     printf("配置文件解析完成，共加载 %zu 条规则\n", rules_cnt);
+    if (fail_cnt > 0) fprintf(stderr, "警告: %zu 条规则因格式无效被跳过\n", fail_cnt);
     return cfg;
 }
 
