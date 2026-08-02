@@ -20,7 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION            "aki-0.2.0"
+#define VERSION            "aki-1.0.0"
 #define CPUSET_ROOT        "/dev/cpuset"
 #define DEFAULT_CPUSET     "AkiAppOpt"
 #define BASE_CPUSET_MAX    256

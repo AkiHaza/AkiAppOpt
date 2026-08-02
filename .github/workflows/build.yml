@@ -39,7 +39,7 @@ jobs:
           count="$(git rev-list --count HEAD)"
           sha="$(git rev-parse --short HEAD)"
           sed -i \
-            -e "s/^version=.*/version=Aki-0.2.0(${count}-${sha})/" \
+            -e "s/^version=.*/version=Aki-1.0.0(${count}-${sha})/" \
             -e "s/^versionCode=.*/versionCode=${count}/" \
             "$MODULE_DIR/module.prop"
 

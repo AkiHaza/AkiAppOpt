@@ -1,6 +1,6 @@
 id=AkiAppOpt
 name=线程优化
-version=Aki-0.2.0
+version=Aki-1.0.0
 versionCode=0
 author=Suto & 秋山叶樱
 description=一个支持自定义规则的安卓应用线程CPU亲和性优化程序
