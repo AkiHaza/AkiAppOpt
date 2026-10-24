@@ -20,8 +20,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "load_balancer.h"
-
 #define VERSION            "aki-1.1.0"
 #define CPUSET_ROOT        "/dev/cpuset"
 #define DEFAULT_CPUSET     "AkiAppOpt"
@@ -50,14 +48,6 @@ typedef struct {
     AffinityRule* first_rule;
     AffinityRule* last_rule;
 } ExactPackageRules;
-
-typedef struct {
-    char (*patterns)[MAX_PKG_LEN];
-    const char** exact_slots;
-    size_t exact_capacity;
-    const char** wildcard_patterns;
-    size_t wildcard_count;
-} PackageFamilyIndex;
 
 typedef struct {
     pid_t tid;
@@ -109,7 +99,6 @@ typedef struct {
     size_t exact_pkg_capacity;
     ExactPackageRules* wildcard_pkg_entries;
     size_t num_wildcard_pkgs;
-    PackageFamilyIndex package_families;
     char config_file[4096];
 } AppConfig;
 
@@ -407,122 +396,66 @@ static bool ensure_cpuset_dir(const cpu_set_t* cpus, const CpuTopology* topo,
 }
 
 typedef struct {
-    unsigned long long performance;
+    unsigned long long max_freq;
     cpu_set_t cpus;
-} CpuPerformanceGroup;
+} CpuFreqGroup;
 
-static int cpu_performance_group_cmp(const void* lhs, const void* rhs) {
-    const CpuPerformanceGroup* a = lhs;
-    const CpuPerformanceGroup* b = rhs;
-    return (a->performance > b->performance) -
-           (a->performance < b->performance);
-}
-
-static bool add_cpu_performance_group(CpuPerformanceGroup** groups,
-                                      size_t* groups_cnt,
-                                      unsigned long long performance,
-                                      const cpu_set_t* cpus) {
-    for (size_t i = 0; i < *groups_cnt; i++) {
-        if ((*groups)[i].performance == performance) {
-            CPU_OR(&(*groups)[i].cpus, &(*groups)[i].cpus, cpus);
-            return true;
-        }
-    }
-    if (*groups_cnt >= SIZE_MAX / sizeof(**groups)) return false;
-    CpuPerformanceGroup* resized = realloc(
-        *groups, (*groups_cnt + 1) * sizeof(**groups));
-    if (!resized) return false;
-    *groups = resized;
-    resized[*groups_cnt].performance = performance;
-    CPU_ZERO(&resized[*groups_cnt].cpus);
-    CPU_OR(&resized[*groups_cnt].cpus, &resized[*groups_cnt].cpus, cpus);
-    (*groups_cnt)++;
-    return true;
-}
-
-static bool parse_positive_value(char* buffer, unsigned long long* value) {
-    char* end = NULL;
-    errno = 0;
-    unsigned long long parsed = strtoull(strtrim(buffer), &end, 10);
-    if (errno == ERANGE || parsed == 0 || !end || *strtrim(end)) return false;
-    *value = parsed;
-    return true;
-}
-
-static bool detect_capacity_groups(const CpuTopology* topo,
-                                   CpuPerformanceGroup** groups,
-                                   size_t* groups_cnt) {
-    bool found_cpu = false;
-    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
-        if (!CPU_ISSET(cpu, &topo->present_cpus)) continue;
-        char path[96];
-        char value_buf[32];
-        int path_len = snprintf(path, sizeof(path),
-                                "/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu);
-        unsigned long long capacity;
-        if (path_len < 0 || (size_t)path_len >= sizeof(path) ||
-            !read_file(AT_FDCWD, path, value_buf, sizeof(value_buf)) ||
-            !parse_positive_value(value_buf, &capacity)) {
-            return false;
-        }
-
-        cpu_set_t cpu_set;
-        CPU_ZERO(&cpu_set);
-        CPU_SET(cpu, &cpu_set);
-        if (!add_cpu_performance_group(groups, groups_cnt, capacity, &cpu_set)) {
-            return false;
-        }
-        found_cpu = true;
-    }
-    return found_cpu;
+static int cpu_freq_group_cmp(const void* lhs, const void* rhs) {
+    const CpuFreqGroup* a = lhs;
+    const CpuFreqGroup* b = rhs;
+    return (a->max_freq > b->max_freq) - (a->max_freq < b->max_freq);
 }
 
 static void detect_core_types(CpuTopology* topo) {
-    CpuPerformanceGroup* groups = NULL;
+    DIR* dir = opendir("/sys/devices/system/cpu/cpufreq");
+    if (!dir) return;
+
+    CpuFreqGroup* groups = NULL;
     size_t groups_cnt = 0;
-    if (!detect_capacity_groups(topo, &groups, &groups_cnt)) {
-        free(groups);
-        groups = NULL;
-        groups_cnt = 0;
+    int root_fd = dirfd(dir);
+    struct dirent* entry;
+    while ((entry = readdir(dir))) {
+        if (strncmp(entry->d_name, "policy", 6) != 0) continue;
+        int policy_fd = openat(root_fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (policy_fd == -1) continue;
 
-        DIR* dir = opendir("/sys/devices/system/cpu/cpufreq");
-        if (!dir) return;
-        int root_fd = dirfd(dir);
-        struct dirent* entry;
-        while ((entry = readdir(dir))) {
-            if (strncmp(entry->d_name, "policy", 6) != 0) continue;
-            int policy_fd = openat(root_fd, entry->d_name,
-                                   O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-            if (policy_fd == -1) continue;
+        char freq_buf[32] = {0};
+        char cpus_buf[256] = {0};
+        bool ok = read_file(policy_fd, "cpuinfo_max_freq", freq_buf, sizeof(freq_buf)) &&
+                  read_file(policy_fd, "related_cpus", cpus_buf, sizeof(cpus_buf));
+        close(policy_fd);
+        if (!ok) continue;
 
-            char cpus_buf[256] = {0};
-            char freq_buf[32] = {0};
-            bool have_cpus = read_file(policy_fd, "related_cpus", cpus_buf,
-                                       sizeof(cpus_buf));
-            bool have_freq = read_file(policy_fd, "cpuinfo_max_freq", freq_buf,
-                                       sizeof(freq_buf));
-            close(policy_fd);
-            if (!have_cpus || !have_freq) continue;
+        char* freq_end = NULL;
+        errno = 0;
+        unsigned long long freq = strtoull(strtrim(freq_buf), &freq_end, 10);
+        if (errno == ERANGE || freq == 0 || !freq_end || *strtrim(freq_end)) continue;
 
-            cpu_set_t policy_cpus;
-            CPU_ZERO(&policy_cpus);
-            unsigned long long max_freq;
-            if (!parse_cpu_list(cpus_buf, &policy_cpus, &topo->present_cpus) ||
-                CPU_COUNT(&policy_cpus) == 0 ||
-                !parse_positive_value(freq_buf, &max_freq)) continue;
-            if (!add_cpu_performance_group(&groups, &groups_cnt, max_freq,
-                                           &policy_cpus)) {
-                free(groups);
-                closedir(dir);
-                return;
+        cpu_set_t policy_cpus;
+        CPU_ZERO(&policy_cpus);
+        if (!parse_cpu_list(cpus_buf, &policy_cpus, &topo->present_cpus) ||
+            CPU_COUNT(&policy_cpus) == 0) continue;
+
+        size_t group_idx = groups_cnt;
+        for (size_t i = 0; i < groups_cnt; i++) {
+            if (groups[i].max_freq == freq) {
+                group_idx = i;
+                break;
             }
         }
-        closedir(dir);
+        if (group_idx == groups_cnt) {
+            CpuFreqGroup* resized = realloc(groups, (groups_cnt + 1) * sizeof(*groups));
+            if (!resized) break;
+            groups = resized;
+            groups[group_idx].max_freq = freq;
+            CPU_ZERO(&groups[group_idx].cpus);
+            groups_cnt++;
+        }
+        CPU_OR(&groups[group_idx].cpus, &groups[group_idx].cpus, &policy_cpus);
     }
+    closedir(dir);
 
-    if (groups_cnt > 1) {
-        qsort(groups, groups_cnt, sizeof(*groups), cpu_performance_group_cmp);
-    }
+    if (groups_cnt > 1) qsort(groups, groups_cnt, sizeof(*groups), cpu_freq_group_cmp);
     for (size_t i = 0; i < groups_cnt; i++) {
         cpu_set_t* target = i == 0 ? &topo->e_core :
                             i == groups_cnt - 1 ? &topo->hp_core : &topo->p_core;
@@ -791,114 +724,6 @@ static bool package_index_matches(const AppConfig* cfg, const char* package_name
     return false;
 }
 
-static int package_family_pattern_cmp(const void* lhs, const void* rhs) {
-    return strcmp(lhs, rhs);
-}
-
-static void free_package_family_index(PackageFamilyIndex* index) {
-    free(index->patterns);
-    free(index->exact_slots);
-    free(index->wildcard_patterns);
-    memset(index, 0, sizeof(*index));
-}
-
-static bool build_package_family_index(const AffinityRule* rules, size_t count,
-                                        PackageFamilyIndex* index) {
-    size_t family_count = 0;
-    for (size_t i = 0; i < count; i++) {
-        const char* separator = strchr(rules[i].pkg, ':');
-        if (separator && separator != rules[i].pkg) family_count++;
-    }
-    if (family_count == 0) return true;
-    if (family_count > SIZE_MAX / sizeof(*index->patterns)) return false;
-    index->patterns = malloc(family_count * sizeof(*index->patterns));
-    if (!index->patterns) return false;
-    size_t written = 0;
-    for (size_t i = 0; i < count; i++) {
-        const char* separator = strchr(rules[i].pkg, ':');
-        if (!separator || separator == rules[i].pkg) continue;
-        size_t length = (size_t)(separator - rules[i].pkg);
-        memcpy(index->patterns[written], rules[i].pkg, length);
-        index->patterns[written++][length] = '\0';
-    }
-    qsort(index->patterns, written, sizeof(*index->patterns), package_family_pattern_cmp);
-    size_t unique_count = 0;
-    size_t exact_count = 0;
-    for (size_t i = 0; i < written; i++) {
-        if (unique_count > 0 &&
-            strcmp(index->patterns[unique_count - 1], index->patterns[i]) == 0) continue;
-        if (i != unique_count) {
-            memcpy(index->patterns[unique_count], index->patterns[i],
-                   sizeof(*index->patterns));
-        }
-        if (pattern_has_wildcards(index->patterns[unique_count])) index->wildcard_count++;
-        else exact_count++;
-        unique_count++;
-    }
-    if (exact_count > 0) {
-        if (exact_count > SIZE_MAX / 2) goto error;
-        index->exact_capacity = 16;
-        while (index->exact_capacity < exact_count * 2) {
-            if (index->exact_capacity > SIZE_MAX / 2) goto error;
-            index->exact_capacity *= 2;
-        }
-        if (index->exact_capacity > SIZE_MAX / sizeof(*index->exact_slots)) goto error;
-        index->exact_slots = calloc(index->exact_capacity, sizeof(*index->exact_slots));
-        if (!index->exact_slots) goto error;
-    }
-    if (index->wildcard_count > 0) {
-        if (index->wildcard_count > SIZE_MAX / sizeof(*index->wildcard_patterns)) goto error;
-        index->wildcard_patterns = malloc(index->wildcard_count * sizeof(*index->wildcard_patterns));
-        if (!index->wildcard_patterns) goto error;
-    }
-    size_t wildcard = 0;
-    for (size_t i = 0; i < unique_count; i++) {
-        const char* pattern = index->patterns[i];
-        if (pattern_has_wildcards(pattern)) {
-            index->wildcard_patterns[wildcard++] = pattern;
-            continue;
-        }
-        size_t slot = (size_t)hash_package_name(pattern) & (index->exact_capacity - 1);
-        while (index->exact_slots[slot]) slot = (slot + 1) & (index->exact_capacity - 1);
-        index->exact_slots[slot] = pattern;
-    }
-    return true;
-
-error:
-    free_package_family_index(index);
-    return false;
-}
-
-static bool package_family_index_matches(const PackageFamilyIndex* index,
-                                          const char* package_name) {
-    if (index->exact_capacity > 0) {
-        size_t slot = (size_t)hash_package_name(package_name) & (index->exact_capacity - 1);
-        while (index->exact_slots[slot]) {
-            if (strcmp(index->exact_slots[slot], package_name) == 0) return true;
-            slot = (slot + 1) & (index->exact_capacity - 1);
-        }
-    }
-    for (size_t i = 0; i < index->wildcard_count; i++) {
-        if (fnmatch(index->wildcard_patterns[i], package_name, FNM_NOESCAPE) == 0) return true;
-    }
-    return false;
-}
-
-static bool load_balancer_rule_match(void* context, const char* package_name) {
-    const AppConfig* cfg = context;
-    if (package_index_matches(cfg, package_name)) return true;
-
-    const char* separator = strchr(package_name, ':');
-    size_t base_length = separator ? (size_t)(separator - package_name) :
-                                     strlen(package_name);
-    if (base_length >= MAX_PKG_LEN) return false;
-    char base_package[MAX_PKG_LEN];
-    memcpy(base_package, package_name, base_length);
-    base_package[base_length] = '\0';
-    if (separator && package_index_matches(cfg, base_package)) return true;
-    return package_family_index_matches(&cfg->package_families, base_package);
-}
-
 static bool rule_matches_package(const AffinityRule* rule, const char* package_name) {
     if (rule->package_is_pattern) {
         return fnmatch(rule->pkg, package_name, FNM_NOESCAPE) == 0;
@@ -1040,7 +865,6 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo,
     size_t exact_pkg_capacity = 0;
     ExactPackageRules* wildcard_pkg_entries = NULL;
     size_t wildcard_pkg_count = 0;
-    PackageFamilyIndex package_families = {0};
     size_t rules_cnt = 0, fail_cnt = 0;
     size_t line_number = 0, block_line = 0;
     char line[256];
@@ -1169,7 +993,6 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo,
     if (!build_package_index(new_rules, rules_cnt, &exact_pkg_entries,
                              &exact_pkg_capacity, &wildcard_pkg_entries,
                              &wildcard_pkg_count)) goto error;
-    if (!build_package_family_index(new_rules, rules_cnt, &package_families)) goto error;
 
     if (last_mtime) *last_mtime = st.st_mtim;
     cfg->rules = new_rules;
@@ -1178,7 +1001,6 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo,
     cfg->exact_pkg_capacity = exact_pkg_capacity;
     cfg->wildcard_pkg_entries = wildcard_pkg_entries;
     cfg->num_wildcard_pkgs = wildcard_pkg_count;
-    cfg->package_families = package_families;
     cfg->mtime = st.st_mtim;
 
     fclose(fp);
@@ -1192,7 +1014,6 @@ error:
     if (new_rules) free(new_rules);
     free(exact_pkg_entries);
     free(wildcard_pkg_entries);
-    free_package_family_index(&package_families);
     fclose(fp);
     free(cfg);
     return NULL;
@@ -1558,7 +1379,6 @@ static void config_release(AppConfig* cfg) {
         if (cfg->rules) free(cfg->rules);
         free(cfg->exact_pkg_entries);
         free(cfg->wildcard_pkg_entries);
-        free_package_family_index(&cfg->package_families);
         free(cfg);
     }
 }
@@ -1680,14 +1500,12 @@ static void print_help(const char* prog_name) {
     printf("Usage: %s [OPTIONS]\n", prog_name);
     printf("Options:\n");
     printf("  -c <config_file>   指定配置文件 (默认: ./applist.conf)\n");
-    printf("  -g <game_list>     指定游戏包名列表 (默认: ./gamelist.conf)\n");
     printf("  -s <interval>      设置检查间隔(秒) (必须>=1, 默认: 2)\n");
     printf("  -b <cpuset_name>   指定 cpuset 目录名 (默认: AkiAppOpt)\n");
     printf("  -v                 显示程序版本\n");
     printf("  -h                 显示帮助信息\n");
     printf("\n示例:\n");
-    printf("  %s -c /data/applist.conf -g /data/gamelist.conf -s 3\n",
-           prog_name);
+    printf("  %s -c /data/applist.conf -s 3\n", prog_name);
     printf("  %s -b MyAppOpt\n", prog_name);
     printf("\nCPU 规格支持数字范围及 e-core、p-core、hp-core、all-core。\n");
     printf("块规则示例:\n");
@@ -1699,10 +1517,9 @@ static void print_help(const char* prog_name) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     char config_file[4096] = "./applist.conf";
-    char game_list_file[4096] = "./gamelist.conf";
     int sleep_interval = 2;
     int opt;
-    while ((opt = getopt(argc, argv, "c:g:s:b:hv")) != -1) {
+    while ((opt = getopt(argc, argv, "c:s:b:hv")) != -1) {
         switch (opt) {
             case 'c':
                 if (!build_str(config_file, sizeof(config_file), optarg, NULL)) {
@@ -1710,13 +1527,6 @@ int main(int argc, char **argv) {
                     exit(EXIT_FAILURE);
                 }
                 printf("配置文件: %s\n", config_file);
-                break;
-            case 'g':
-                if (!build_str(game_list_file, sizeof(game_list_file), optarg, NULL)) {
-                    fprintf(stderr, "游戏列表路径过长\n");
-                    exit(EXIT_FAILURE);
-                }
-                printf("游戏列表: %s\n", game_list_file);
                 break;
             case 's':
             {
@@ -1753,28 +1563,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    struct stat game_list_stat;
-    if (stat(game_list_file, &game_list_stat) != 0) {
-        const char* initial_content =
-            "# 每行填写一个游戏包名，支持 fnmatch 通配符\n"
-            "# 示例: com.example.game\n";
-        if (write_file(AT_FDCWD, game_list_file, initial_content,
-                       O_WRONLY | O_CREAT | O_TRUNC)) {
-            printf("游戏列表不存在，已创建: %s\n", game_list_file);
-        }
-    }
-
     CpuTopology topo = init_cpu_topo();
-    LoadBalancer* load_balancer = load_balancer_create(game_list_file);
-    if (!load_balancer) {
-        fprintf(stderr, "警告: 自动负载分配器初始化失败，仅应用显式规则\n");
-    }
-    LoadBalancerTopology load_topology = {
-        .present_cpus = topo.present_cpus,
-        .e_core = topo.e_core,
-        .p_core = topo.p_core,
-        .hp_core = topo.hp_core
-    };
 
     struct stat st;
     if (stat(config_file, &st) != 0) {
@@ -1817,7 +1606,7 @@ int main(int argc, char **argv) {
     *interval_ptr = sleep_interval;
 
     if (pthread_create(&loader_thread, NULL, config_loader_thread, interval_ptr) != 0) {
-        perror("config loader thread creation failed");
+        perror("配置加载器线程创建失败");
         free(interval_ptr);
         config_release(replace_config(NULL));
         if (inotify_supported) close(inotify_fd);
@@ -1828,7 +1617,6 @@ int main(int argc, char **argv) {
     ProcCache cache = {0};
     uint64_t next_scan_ms = 0;
     uint64_t next_delayed_bind_ms = UINT64_MAX;
-    uint64_t next_load_balance_ms = 0;
     bool affinity_restore_pending = false;
     bool affinity_restore_warning_shown = false;
     printf("启动AppOpt服务 v%s\n", VERSION);
@@ -1836,7 +1624,6 @@ int main(int argc, char **argv) {
     for (;;) {
         uint64_t now_ms = monotonic_ms();
         if (atomic_exchange(&config_updated, 0)) {
-            load_balancer_reset(load_balancer, &topo.present_cpus);
             affinity_restore_pending = true;
             affinity_restore_warning_shown = false;
         }
@@ -1868,16 +1655,6 @@ int main(int argc, char **argv) {
                 config_release(cfg);
             }
             next_scan_ms = now_ms + (uint64_t)sleep_interval * 1000ULL;
-        }
-
-        if (load_balancer && now_ms >= next_load_balance_ms) {
-            AppConfig* cfg = get_config();
-            if (cfg) {
-                load_balancer_tick(load_balancer, &load_topology,
-                                   load_balancer_rule_match, cfg);
-                config_release(cfg);
-            }
-            next_load_balance_ms = monotonic_ms() + 1000ULL;
         }
 
         now_ms = monotonic_ms();

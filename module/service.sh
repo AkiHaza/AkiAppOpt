@@ -77,7 +77,7 @@ if [ "$APP_OPT_RUNNING" != "1" ]; then
 	fi
 	# Keep the first 64 KiB for diagnosis, then drain output without growing the log.
 	( trap '' HUP; head -c "$MAX_LOG_BYTES" >> "$LOG_FILE"; cat > /dev/null ) < "$LOG_PIPE" &
-	nohup "$MODDIR/AppOpt" -c "$MODDIR/applist.conf" -g "$MODDIR/gamelist.conf" > "$LOG_PIPE" 2>&1 &
+	nohup "$MODDIR/AppOpt" -c "$MODDIR/applist.conf" > "$LOG_PIPE" 2>&1 &
 	NEW_PID=$!
 	echo "$NEW_PID" > "$PID_FILE"
 	sleep 1

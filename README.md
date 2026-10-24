@@ -11,10 +11,9 @@
 | 特性 | 说明 |
 |------|------|
 | **自定义规则** | 支持传统单行及块语法、线程通配符，按具体度与配置顺序选择命中规则 |
-| **语义核心** | 自动检测 CPU 性能簇，支持 `e-core` / `p-core` / `hp-core` / `all-core` |
+| **语义核心** | 自动检测 CPU 频率簇，支持 `e-core` / `p-core` / `hp-core` / `all-core` |
 | **热加载** | 基于 inotify 实时监控配置文件变更，无需重启服务 |
-| **低开销** | 包名与应用族索引 + 规则候选分组 + 线程匹配提前结束，减少无关规则遍历与重复 I/O |
-| **自动负载分配** | 未命中规则的 Android 应用按线程 CPU 负载分配到 e-core / p-core / hp-core，显式规则优先 |
+| **低开销** | 包名哈希索引 + 规则候选分组 + 线程匹配提前结束，减少无关规则遍历与重复 I/O |
 | **多架构** | 支持 arm64-v8a / armabi-v7a / x86_64 |
 | **Magisk 模块** | 以 Magisk / KernelSU 模块形式分发，开机自启 |
 
@@ -31,15 +30,15 @@
 ```bash
 # arm64-v8a
 aarch64-linux-android21-clang -O2 -s -static \
-  -o module/bin/arm64-v8a/AppOpt module/AppOpt.c module/load_balancer.c
+  -o module/bin/arm64-v8a/AppOpt module/AppOpt.c
 
 # armabi-v7a
 armv7a-linux-androideabi21-clang -O2 -s -static \
-  -o module/bin/armabi-v7a/AppOpt module/AppOpt.c module/load_balancer.c
+  -o module/bin/armabi-v7a/AppOpt module/AppOpt.c
 
 # x86_64
 x86_64-linux-android21-clang -O2 -s -static \
-  -o module/bin/x86_64/AppOpt module/AppOpt.c module/load_balancer.c
+  -o module/bin/x86_64/AppOpt module/AppOpt.c
 ```
 
 以上命令只编译主程序。可刷入的 zip 还需要 `META-INF` 下的 Magisk 安装器；请使用仓库的 GitHub Actions 构建流程，它会生成安装器并打包。
@@ -57,14 +56,13 @@ AppOpt [选项]
 
 选项:
   -c <路径>    指定配置文件路径（默认: ./applist.conf）
-  -g <路径>    指定游戏包名列表（默认: ./gamelist.conf）
   -s <秒>      设置检查间隔，必须 ≥ 1（默认: 2）
   -b <名称>    指定 /dev/cpuset 下的目录名（默认: AkiAppOpt）
   -v           显示版本信息
   -h           显示帮助
 
 示例:
-  AppOpt -c /data/applist.conf -g /data/gamelist.conf -s 3
+  AppOpt -c /data/applist.conf -s 3
   AppOpt -b MyAppOpt
 ```
 
@@ -115,28 +113,6 @@ com.example {
 - 多条进程规则命中时选择包名模式最具体的一条；同等具体度保持配置文件中靠前规则优先
 - `cpuset` 不可用时仍会通过 `sched_setaffinity()` 应用规则
 
-### 自动负载分配
-
-未被 `applist.conf` 规则命中的 Android 应用会由独立的 `load_balancer` 模块每秒采样一次线程 CPU 时间增量。采样结果经过平滑后按进程内负载排序，避免短时尖峰导致线程频繁跨簇迁移：
-
-- 普通应用：有负载的前两个线程优先使用 `p-core`；第三名负载不低于第二名一半时也使用 `p-core`；其余线程使用 `e-core + p-core`
-- 游戏进程：有负载的第一名线程使用 `hp-core`，第二名使用 `p-core`，其余线程使用 `e-core + p-core`
-
-游戏包名通过 `gamelist.conf` 配置，每行一个包名，支持 `fnmatch` 通配符以及以 `#`、`//` 开头的整行注释：
-
-```text
-com.example.game
-com.tencent.*
-```
-
-精确主包名同时匹配它的 `:子进程`。文件每秒检查一次修改时间，保存后无需重启服务即可生效。
-
-核心簇优先按内核导出的 `cpu_capacity` 分组，缺失时回退到 `cpuinfo_max_freq`。例如 2+3+2+1 四簇结构会映射为最低簇 `e-core`、两个中间簇 `p-core`、最高簇 `hp-core`；双簇设备没有独立 `p-core` 时，自动策略会将性能线程回退到大核。模块只通过 `sched_setaffinity()` 限定允许的核心簇，支持 EAS 的内核仍会结合 PELT 利用率、CPU 剩余容量和 Energy Model 在掩码内选择具体 CPU；Android cpuset 限制仍由内核强制执行。
-
-`gamelist.conf` 未命中的进程仍会根据包名和线程名中的 `game`、`unity`、`unreal`、`ue4`、`ue5`、`cocos`、`godot` 等特征进行兼容识别。只要主包或任一 `:子进程` 存在显式规则，整个应用族都会跳过自动负载分配。
-
-参考：[Linux EAS](https://docs.kernel.org/scheduler/sched-energy.html)、[Capacity Aware Scheduling](https://docs.kernel.org/scheduler/sched-capacity.html)。
-
 ---
 
 ## 模块结构
@@ -149,8 +125,7 @@ com.tencent.*
 ├── service.sh          ← 开机启动脚本
 ├── module.prop         ← 模块元信息
 ├── customize.sh        ← 刷入时安装脚本
-├── applist.conf        ← 线程规则配置文件
-└── gamelist.conf       ← 游戏包名配置文件
+└── applist.conf        ← 默认配置文件
 ```
 
 ---
@@ -172,8 +147,8 @@ com.tencent.*
 └──────────┘     └──────────────┘     └───────────────────────┘
 ```
 
-1. 服务启动时解析 `applist.conf` 和 `gamelist.conf`，在 `/dev/cpuset/AkiAppOpt/` 下创建对应 cpuset 分组
-2. 周期性扫描 `/proc`，显式规则应用于命中进程，未规定应用按游戏列表和线程负载自动分簇
+1. 服务启动时解析 `applist.conf`，在 `/dev/cpuset/AkiAppOpt/` 下创建对应 cpuset 分组
+2. 周期性扫描 `/proc`，通过 PID 跟踪与增量扫描机制降低开销
 3. 将匹配线程的 PID 写入对应 cpuset 的 `tasks` 文件，同时调用 `sched_setaffinity()` 设置 CPU 亲和性
 4. inotify 事件驱动配置文件热加载，自动回退到轮询模式作为兼容方案
 

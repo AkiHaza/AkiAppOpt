@@ -61,8 +61,6 @@ module_instructions() {
 	ui_print "********************************************"
 	ui_print "线程规则配置文件路径为："
 	ui_print "/data/adb/modules/AkiAppOpt/applist.conf"
-	ui_print "游戏包名配置文件路径为："
-	ui_print "/data/adb/modules/AkiAppOpt/gamelist.conf"
 	ui_print "------------------------------------------"
 	ui_print "修改与添加规则无需重启，即时生效"
 	ui_print "AppOpt 启动时自动识别 CPU 频率簇"
@@ -72,8 +70,6 @@ module_instructions() {
 	ui_print "规则示例："
 	ui_print "com.example=all-core"
 	ui_print "com.example{RenderThread}=hp-core"
-	ui_print "游戏包名示例（写入 gamelist.conf）："
-	ui_print "com.example.game"
 	ui_print "------------------------------------------"
 	ui_print "更多规则使用说明请参考："
 	ui_print "http://AppOpt.suto.top"
@@ -85,12 +81,6 @@ preserve_existing_config() {
 		mv "$MODPATH/applist.conf" "$MODPATH/applist.conf.bak"
 		cp "$OLD_CONFIG" "$MODPATH/applist.conf"
 		ui_print "- 已保留现有 applist.conf"
-	fi
-	OLD_GAME_LIST=/data/adb/modules/AkiAppOpt/gamelist.conf
-	if [ -f "$OLD_GAME_LIST" ]; then
-		mv "$MODPATH/gamelist.conf" "$MODPATH/gamelist.conf.bak"
-		cp "$OLD_GAME_LIST" "$MODPATH/gamelist.conf"
-		ui_print "- 已保留现有 gamelist.conf"
 	fi
 }
 check_magisk_version
