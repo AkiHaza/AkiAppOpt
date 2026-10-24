@@ -159,31 +159,29 @@ static void reload_game_patterns(LoadBalancer *balancer) {
     balancer->game_list_loaded = true;
 }
 
-static bool read_thread_stat(pid_t pid, pid_t tid, unsigned long long *ticks,
-                             unsigned long long *start_time) {
-    char path[96];
-    char stat_line[512];
-    char *close_paren;
-    char *cursor;
+static bool parse_thread_stat(const char *stat_line, unsigned long long *ticks,
+                              unsigned long long *start_time,
+                              char *name, size_t name_size) {
+    const char *open_paren;
+    const char *close_paren;
+    const char *cursor;
     unsigned long long user_ticks = 0;
     unsigned long long system_ticks = 0;
     unsigned long long thread_start_time = 0;
 
-    if (snprintf(path, sizeof(path), "/proc/%d/task/%d/stat", pid, tid) < 0 ||
-        !read_path(path, stat_line, sizeof(stat_line))) {
-        return false;
-    }
-
+    if (name && name_size > 0) name[0] = '\0';
     /* comm may contain spaces and ')'; fields start after the final ')'. */
+    open_paren = strchr(stat_line, '(');
     close_paren = strrchr(stat_line, ')');
-    if (!close_paren || close_paren[1] != ' ') return false;
+    if (!open_paren || !close_paren || open_paren >= close_paren ||
+        close_paren[1] != ' ') return false;
     cursor = close_paren + 2;
 
     /* cursor starts at field 3; utime/stime/starttime are fields 14/15/22. */
     for (int field = 3; field <= 22; field++) {
         while (*cursor == ' ') cursor++;
         if (!*cursor) return false;
-        char *end = cursor;
+        const char *end = cursor;
         while (*end && *end != ' ') end++;
         if (field == 14 || field == 15 || field == 22) {
             char *number_end;
@@ -197,6 +195,13 @@ static bool read_thread_stat(pid_t pid, pid_t tid, unsigned long long *ticks,
         cursor = end;
     }
 
+    if (name && name_size > 0) {
+        size_t name_length = (size_t)(close_paren - open_paren - 1);
+        if (name_length >= name_size) name_length = name_size - 1;
+        memcpy(name, open_paren + 1, name_length);
+        name[name_length] = '\0';
+        name[strcspn(name, "\r\n")] = '\0';
+    }
     *ticks = user_ticks > ULLONG_MAX - system_ticks
                  ? ULLONG_MAX
                  : user_ticks + system_ticks;
@@ -204,12 +209,14 @@ static bool read_thread_stat(pid_t pid, pid_t tid, unsigned long long *ticks,
     return true;
 }
 
-static bool read_thread_name(pid_t pid, pid_t tid, char *name, size_t size) {
+static bool read_thread_stat(pid_t pid, pid_t tid, unsigned long long *ticks,
+                             unsigned long long *start_time,
+                             char *name, size_t name_size) {
     char path[96];
-    if (snprintf(path, sizeof(path), "/proc/%d/task/%d/comm", pid, tid) < 0 ||
-        !read_path(path, name, size)) return false;
-    name[strcspn(name, "\r\n")] = '\0';
-    return name[0] != '\0';
+    char stat_line[512];
+    if (snprintf(path, sizeof(path), "/proc/%d/task/%d/stat", pid, tid) < 0 ||
+        !read_path(path, stat_line, sizeof(stat_line))) return false;
+    return parse_thread_stat(stat_line, ticks, start_time, name, name_size);
 }
 
 static bool read_package_name(pid_t pid, char *name, size_t size) {
@@ -301,6 +308,29 @@ static int thread_load_cmp(const void *left, const void *right) {
     if (a->load < b->load) return 1;
     if (a->load > b->load) return -1;
     return (a->tid > b->tid) - (a->tid < b->tid);
+}
+
+static size_t select_top_threads(ThreadLoad *threads, size_t count,
+                                 ThreadLoad *top[3]) {
+    /* Only these ranks affect CPU tiers; keep the full-sort tie order. */
+    size_t top_count = 0;
+    for (size_t i = 0; i < count; i++) {
+        ThreadLoad *candidate = &threads[i];
+        size_t insert_at;
+        if (top_count == 3 && thread_load_cmp(candidate, top[2]) >= 0) continue;
+        insert_at = 0;
+        while (insert_at < top_count &&
+               thread_load_cmp(candidate, top[insert_at]) >= 0) {
+            insert_at++;
+        }
+        if (top_count < 3) top_count++;
+        if (insert_at < top_count - 1) {
+            memmove(&top[insert_at + 1], &top[insert_at],
+                    (top_count - insert_at - 1) * sizeof(*top));
+        }
+        top[insert_at] = candidate;
+    }
+    return top_count;
 }
 
 static int load_sample_cmp(const void *left, const void *right) {
@@ -415,11 +445,12 @@ static unsigned long long smooth_load(unsigned long long previous,
     return (previous >> 1) + (scaled >> 1) + (previous & scaled & 1ULL);
 }
 
-static size_t app_performance_thread_count(const ThreadLoad *threads, size_t count) {
+static size_t app_performance_thread_count(ThreadLoad *const *threads,
+                                           size_t count) {
     size_t promoted = 0;
-    while (promoted < count && promoted < 2 && threads[promoted].load > 0) promoted++;
-    if (promoted == 2 && count > 2 && threads[2].load > 0 &&
-        threads[2].load >= (threads[1].load >> 1) + (threads[1].load & 1ULL)) {
+    while (promoted < count && promoted < 2 && threads[promoted]->load > 0) promoted++;
+    if (promoted == 2 && count > 2 && threads[2]->load > 0 &&
+        threads[2]->load >= (threads[1]->load >> 1) + (threads[1]->load & 1ULL)) {
         promoted = 3;
     }
     return promoted;
@@ -507,20 +538,20 @@ void load_balancer_tick(LoadBalancer *balancer,
             tid_long = strtol(task_entry->d_name, &end, 10);
             if (*end || tid_long <= 0 || tid_long > INT32_MAX) continue;
             pid_t tid = (pid_t)tid_long;
-            if (!read_thread_stat(pid, tid, &ticks, &start_time)) continue;
-            bool thread_has_history = false;
-            LoadSample *sample = find_sample(balancer, history_count, pid, tid,
-                                             ticks, start_time,
-                                             &thread_has_history);
-            if (!sample) continue;
             ThreadLoad *thread = get_thread_slot(balancer, thread_count);
             if (!thread) {
                 allocation_failed = true;
                 break;
             }
+            if (!read_thread_stat(pid, tid, &ticks, &start_time,
+                                  thread->name, sizeof(thread->name))) continue;
+            bool thread_has_history = false;
+            LoadSample *sample = find_sample(balancer, history_count, pid, tid,
+                                             ticks, start_time,
+                                             &thread_has_history);
+            if (!sample) continue;
             thread_count++;
             thread->tid = tid;
-            (void)read_thread_name(pid, tid, thread->name, sizeof(thread->name));
             sample->generation = balancer->generation;
             if (thread_has_history && sample->ticks <= ticks) {
                 sample->smoothed_load = smooth_load(sample->smoothed_load,
@@ -536,7 +567,9 @@ void load_balancer_tick(LoadBalancer *balancer,
         if (allocation_failed || !have_history || thread_count == 0) continue;
 
         ThreadLoad *threads = balancer->thread_buffer;
-        qsort(threads, thread_count, sizeof(*threads), thread_load_cmp);
+        ThreadLoad *top_threads[3] = {0};
+        size_t top_thread_count = select_top_threads(threads, thread_count,
+                                                     top_threads);
         bool game = looks_like_game(balancer, package_name, threads,
                                     thread_count);
         cpu_set_t p_core = core_or_fallback(&topology->p_core, &topology->hp_core);
@@ -548,14 +581,21 @@ void load_balancer_tick(LoadBalancer *balancer,
         cpu_set_t mixed = union_cores(&e_core, &p_core);
         if (CPU_COUNT(&mixed) == 0) mixed = topology->present_cpus;
         size_t app_performance_threads = game ? 0 :
-            app_performance_thread_count(threads, thread_count);
+            app_performance_thread_count(top_threads, top_thread_count);
         for (size_t i = 0; i < thread_count; i++) {
             const cpu_set_t *target;
+            size_t rank = SIZE_MAX;
+            for (size_t j = 0; j < top_thread_count; j++) {
+                if (&threads[i] == top_threads[j]) {
+                    rank = j;
+                    break;
+                }
+            }
             if (game) {
-                target = i == 0 && threads[i].load > 0 ? &hp_core :
-                         i == 1 && threads[i].load > 0 ? &p_core : &mixed;
+                target = rank == 0 && threads[i].load > 0 ? &hp_core :
+                         rank == 1 && threads[i].load > 0 ? &p_core : &mixed;
             } else {
-                target = i < app_performance_threads ? &p_core : &mixed;
+                target = rank < app_performance_threads ? &p_core : &mixed;
             }
             apply_thread_affinity(threads[i].tid, target,
                                   &topology->present_cpus);

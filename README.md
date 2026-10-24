@@ -10,10 +10,10 @@
 
 | 特性 | 说明 |
 |------|------|
-| **自定义规则** | 支持传统单行及块语法、线程通配符，以及多条命中规则合并 |
+| **自定义规则** | 支持传统单行及块语法、线程通配符，按具体度与配置顺序选择命中规则 |
 | **语义核心** | 自动检测 CPU 性能簇，支持 `e-core` / `p-core` / `hp-core` / `all-core` |
 | **热加载** | 基于 inotify 实时监控配置文件变更，无需重启服务 |
-| **低开销** | 包名哈希索引 + 通配模式分离 + PID 跟踪与增量扫描，降低进程筛选成本 |
+| **低开销** | 包名与应用族索引 + 规则候选分组 + 线程匹配提前结束，减少无关规则遍历与重复 I/O |
 | **自动负载分配** | 未命中规则的 Android 应用按线程 CPU 负载分配到 e-core / p-core / hp-core，显式规则优先 |
 | **多架构** | 支持 arm64-v8a / armabi-v7a / x86_64 |
 | **Magisk 模块** | 以 Magisk / KernelSU 模块形式分发，开机自启 |
@@ -42,13 +42,9 @@ x86_64-linux-android21-clang -O2 -s -static \
   -o module/bin/x86_64/AppOpt module/AppOpt.c module/load_balancer.c
 ```
 
-编译完成后，将 `module/` 目录打包为 zip 即可刷入：
+以上命令只编译主程序。可刷入的 zip 还需要 `META-INF` 下的 Magisk 安装器；请使用仓库的 GitHub Actions 构建流程，它会生成安装器并打包。
 
-```bash
-cd module && zip -r ../AppOpt.zip .
-```
-
-> CI 构建由 GitHub Actions 自动完成，产物可从 [Releases](https://github.com/AkiHaza/AkiAppOpt/releases) 获取。
+> CI 构建由 GitHub Actions 自动完成，产物可从 Actions 下载；发布产物可从 [Releases](https://github.com/AkiHaza/AkiAppOpt/releases) 获取。
 
 ---
 
@@ -106,6 +102,10 @@ com.example {
 语义核心可与数字范围混合，例如 `e-core,4-5`。设备不存在对应频率层时，该语义核心为空；比如双簇 CPU 通常没有 `p-core`。行尾支持 `#` 或 `//` 注释。
 
 延迟从应用被 AppOpt 识别时开始计算。不写延迟或使用 `:0` 时行为与原规则相同；配置热加载和进程缓存重扫不会重新计时。
+
+显式规则按 `-s` 设置的间隔扫描新进程和新线程，默认 2 秒；不依赖系统总线程数增加。配置无效时会输出文件路径、行号及原因，最多显示前 20 条详细错误；超过长度限制的行整行跳过。
+
+模块服务在模块目录的 `AppOpt.log` 中保留本次启动的前 64 KiB 输出，并记录启动失败；下一次启动新实例时重置日志。
 
 **匹配与优先级：**
 

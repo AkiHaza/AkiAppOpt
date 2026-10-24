@@ -10,9 +10,9 @@ on:
         type: string
   push:
     branches: [Dev, main]
-    paths: [module/**, .github/workflows/build.yml]
+    paths: [module/**, .gitattributes, .github/workflows/build.yml]
   pull_request:
-    paths: [module/**, .github/workflows/build.yml]
+    paths: [module/**, .gitattributes, .github/workflows/build.yml]
 
 permissions:
   contents: read

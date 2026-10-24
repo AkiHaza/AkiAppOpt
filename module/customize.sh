@@ -100,4 +100,8 @@ remove_sys_perf_config
 module_instructions
 preserve_existing_config
 set_perm_recursive "$MODPATH" 0 0 0755 0644
-set_perm_recursive "$MODPATH/*.sh $MODPATH/AppOpt" 0 2000 0755 0755 u:object_r:magisk_file:s0
+set_perm "$MODPATH/AppOpt" 0 2000 0755 u:object_r:magisk_file:s0
+for SCRIPT in "$MODPATH"/*.sh; do
+	[ -f "$SCRIPT" ] || continue
+	set_perm "$SCRIPT" 0 2000 0755 u:object_r:magisk_file:s0
+done
