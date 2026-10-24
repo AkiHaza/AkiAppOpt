@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/select.h>
 #include <sys/stat.h>
@@ -29,6 +30,7 @@
 #define INITIAL_RULE_CAPACITY 64
 #define DELAY_UNIT_MS      100ULL
 #define DELAY_POLL_US      100000
+#define INSTANCE_RUNNING_EXIT 73
 
 typedef struct AffinityRule {
     char pkg[MAX_PKG_LEN];
@@ -191,6 +193,49 @@ static bool set_base_cpuset(const char* name) {
     }
     int len = snprintf(base_cpuset, sizeof(base_cpuset), "%s/%s", CPUSET_ROOT, name);
     return len > 0 && (size_t)len < sizeof(base_cpuset);
+}
+
+/* The separate lock survives atomic replacement of the configuration file. */
+static int acquire_instance_lock(const char* config_file) {
+    char canonical[PATH_MAX];
+    if (!realpath(config_file, canonical)) {
+        if (errno != ENOENT) return -1;
+        char parent[PATH_MAX];
+        const char* slash = strrchr(config_file, '/');
+        const char* name = slash ? slash + 1 : config_file;
+        size_t parent_len = slash ? (size_t)(slash - config_file) : 0;
+        if (!*name || parent_len >= sizeof(parent)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        if (slash && parent_len > 0) {
+            memcpy(parent, config_file, parent_len);
+            parent[parent_len] = '\0';
+        } else {
+            strcpy(parent, slash ? "/" : ".");
+        }
+        char resolved_parent[PATH_MAX];
+        if (!realpath(parent, resolved_parent)) return -1;
+        if (!build_str(canonical, sizeof(canonical), resolved_parent, "/", name, NULL)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+    }
+    char lock_path[PATH_MAX];
+    if (!build_str(lock_path, sizeof(lock_path), canonical, ".lock", NULL)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd == -1) return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) == -1) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    /* Intentionally held until process exit; never unlink a live lock inode. */
+    return fd;
 }
 
 static bool parse_cpu_ranges(const char* spec, cpu_set_t* set, const cpu_set_t* present) {
@@ -1519,6 +1564,12 @@ static void print_help(const char* prog_name) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
+    /* fd 9 belongs to service.sh. Its shared open description retains this lock. */
+    if (argc == 2 && strcmp(argv[1], "--acquire-service-lock") == 0) {
+        if (flock(9, LOCK_EX | LOCK_NB) == 0) return EXIT_SUCCESS;
+        return errno == EWOULDBLOCK || errno == EAGAIN ?
+               INSTANCE_RUNNING_EXIT : EXIT_FAILURE;
+    }
     char config_file[4096] = "./applist.conf";
     int sleep_interval = 2;
     int opt;
@@ -1564,6 +1615,16 @@ int main(int argc, char **argv) {
                 print_help(argv[0]);
                 exit(EXIT_FAILURE);
         }
+    }
+
+    int instance_lock_fd = acquire_instance_lock(config_file);
+    if (instance_lock_fd == -1) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            fprintf(stderr, "该配置已有 AppOpt 实例运行\n");
+            return INSTANCE_RUNNING_EXIT;
+        }
+        perror("无法锁定配置实例");
+        return EXIT_FAILURE;
     }
 
     CpuTopology topo = init_cpu_topo();
