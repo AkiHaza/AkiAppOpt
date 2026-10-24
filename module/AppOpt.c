@@ -1177,11 +1177,15 @@ static bool proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
             long tid = strtol(tent->d_name, &end2, 10);
             if (*end2 != '\0')  continue;
             char tname[MAX_THREAD_LEN] = {0};
-            char comm_path[64];
-            if (!build_str(comm_path, sizeof(comm_path), tent->d_name, "/comm", NULL)) continue;
-            if (!read_file(task_fd, comm_path, tname, sizeof(tname))) continue;
-
-            char* trimmed_name = strtrim(tname);
+            char* trimmed_name = tname;
+            const AffinityRule* matched_rule = NULL;
+            if (proc->num_thread_rules > 0) {
+                char comm_path[64];
+                if (!build_str(comm_path, sizeof(comm_path), tent->d_name, "/comm", NULL)) continue;
+                if (!read_file(task_fd, comm_path, tname, sizeof(tname))) continue;
+                trimmed_name = strtrim(tname);
+                matched_rule = match_thread_rule(proc, trimmed_name);
+            }
 
             if (proc->num_threads >= proc->threads_cap) {
                 size_t new_cap = proc->threads_cap * 2;
@@ -1195,7 +1199,6 @@ static bool proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
             ti->tid = tid;
             build_str(ti->name, sizeof(ti->name), trimmed_name, NULL);
             CPU_ZERO(&ti->cpus);
-            const AffinityRule* matched_rule = match_thread_rule(proc, ti->name);
 
             if (matched_rule) {
                 ti->cpus = matched_rule->cpus;
