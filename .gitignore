@@ -50,3 +50,8 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+# Locally generated module configuration and runtime state
+/module/applist.conf
+/module/applist.conf.previous
+/module/run/

@@ -221,21 +221,69 @@ static int acquire_instance_lock(const char* config_file) {
             return -1;
         }
     }
-    char lock_path[PATH_MAX];
-    if (!build_str(lock_path, sizeof(lock_path), canonical, ".lock", NULL)) {
+    char* slash = strrchr(canonical, '/');
+    const char* name = slash + 1;
+    char parent[PATH_MAX], lock_name[PATH_MAX], legacy_name[PATH_MAX];
+    size_t parent_len = (size_t)(slash - canonical);
+    memcpy(parent, canonical, parent_len);
+    parent[parent_len] = '\0';
+    if (!parent_len) strcpy(parent, "/");
+    if (!build_str(lock_name, sizeof(lock_name), "config.", name, ".lock", NULL) ||
+        !build_str(legacy_name, sizeof(legacy_name), "legacy.config.", name, ".lock", NULL)) {
         errno = ENAMETOOLONG;
         return -1;
     }
-    int fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (fd == -1) return -1;
-    if (flock(fd, LOCK_EX | LOCK_NB) == -1) {
+    int parent_fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (parent_fd == -1) return -1;
+    int run_fd = -1, fd = -1, legacy_fd = -1, old_fd = -1;
+    bool created_run = mkdirat(parent_fd, "run", 0700) == 0;
+    if (!created_run && errno != EEXIST) goto fail;
+    run_fd = openat(parent_fd, "run", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (run_fd == -1) goto fail;
+    struct stat run_st;
+    if (fstat(run_fd, &run_st) == -1) goto fail;
+    if (run_st.st_uid != geteuid() || (run_st.st_mode & 0077) != 0) {
+        errno = EACCES;
+        goto fail;
+    }
+    if (created_run && fchmod(run_fd, 0700) == -1) goto fail;
+    fd = openat(run_fd, lock_name, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd == -1 || flock(fd, LOCK_EX | LOCK_NB) == -1) goto fail;
+
+    /* Preserve and lock existing inodes while moving old layouts into run/. */
+    legacy_fd = openat(run_fd, legacy_name, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    if (legacy_fd == -1 && errno != ENOENT) goto fail;
+    if (legacy_fd != -1 && flock(legacy_fd, LOCK_EX | LOCK_NB) == -1) goto fail;
+    char old_name[PATH_MAX];
+    if (!build_str(old_name, sizeof(old_name), name, ".lock", NULL)) {
+        errno = ENAMETOOLONG;
+        goto fail;
+    }
+    old_fd = openat(parent_fd, old_name, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    if (old_fd == -1 && errno != ENOENT) goto fail;
+    if (old_fd != -1) {
+        struct stat old_st, legacy_st;
+        if (fstat(old_fd, &old_st) == -1) goto fail;
+        bool same_inode = legacy_fd != -1 && fstat(legacy_fd, &legacy_st) == 0 &&
+                          old_st.st_dev == legacy_st.st_dev && old_st.st_ino == legacy_st.st_ino;
+        if (!same_inode && flock(old_fd, LOCK_EX | LOCK_NB) == -1) goto fail;
+        if (renameat(parent_fd, old_name, run_fd, legacy_name) == -1) goto fail;
+    }
+    close(run_fd);
+    close(parent_fd);
+    /* All instance and compatibility descriptors remain held until exit. */
+    return fd;
+fail:
+    {
         int saved_errno = errno;
-        close(fd);
+        if (old_fd != -1) close(old_fd);
+        if (legacy_fd != -1) close(legacy_fd);
+        if (fd != -1) close(fd);
+        if (run_fd != -1) close(run_fd);
+        close(parent_fd);
         errno = saved_errno;
         return -1;
     }
-    /* Intentionally held until process exit; never unlink a live lock inode. */
-    return fd;
 }
 
 static bool parse_cpu_ranges(const char* spec, cpu_set_t* set, const cpu_set_t* present) {
@@ -1631,8 +1679,7 @@ int main(int argc, char **argv) {
 
     struct stat st;
     if (stat(config_file, &st) != 0) {
-        const char* initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n";
-        if (write_file(AT_FDCWD, config_file, initial_content, O_WRONLY | O_CREAT | O_TRUNC)) {
+        if (write_file(AT_FDCWD, config_file, "", O_WRONLY | O_CREAT | O_EXCL)) {
             printf("配置文件不存在，重建一个空的配置文件: %s\n", config_file);
         }
     }

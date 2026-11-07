@@ -1,7 +1,10 @@
 #!/system/bin/sh
-MODDIR=${0%/*}
-PID_FILE="$MODDIR/AppOpt.pid"
-LOG_FILE="$MODDIR/AppOpt.log"
+MODDIR=$(CDPATH= cd -P -- "${0%/*}" && pwd) || exit 1
+RUNDIR="$MODDIR/run"
+PID_FILE="$RUNDIR/AppOpt.pid"
+WATCHDOG_FILE="$RUNDIR/AppOpt.watchdog.pid"
+LOG_FILE="$RUNDIR/AppOpt.log"
+umask 077
 MAX_LOG_BYTES=65536
 BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
 
@@ -47,8 +50,9 @@ appopt_identity_is_alive() {
 }
 
 read_pid_record() {
-	[ -r "$PID_FILE" ] || return 1
-	IFS=' ' read -r RECORD_PID RECORD_START RECORD_BOOT RECORD_EXTRA < "$PID_FILE" 2>/dev/null || return 1
+	local record_file=${1:-$PID_FILE}
+	[ -r "$record_file" ] || return 1
+	IFS=' ' read -r RECORD_PID RECORD_START RECORD_BOOT RECORD_EXTRA < "$record_file" 2>/dev/null || return 1
 	[ -z "$RECORD_EXTRA" ] &&
 		appopt_identity_is_alive "$RECORD_PID" "$RECORD_START" "$RECORD_BOOT"
 }
@@ -73,9 +77,12 @@ stop_appopt_identity() {
 }
 
 stop_late_load_instance() {
-	if read_pid_record; then
-		stop_appopt_identity "$RECORD_PID" "$RECORD_START" "$RECORD_BOOT"
-	fi
+	local record_file
+	for record_file in "$PID_FILE" "$MODDIR/AppOpt.pid"; do
+		if read_pid_record "$record_file"; then
+			stop_appopt_identity "$RECORD_PID" "$RECORD_START" "$RECORD_BOOT"
+		fi
+	done
 	# Legacy records are accepted only after capturing an exact binary identity.
 	if command -v pidof >/dev/null 2>&1; then
 		APP_OPT_PIDS=$(pidof AppOpt 2>/dev/null)
@@ -87,7 +94,7 @@ stop_late_load_instance() {
 			stop_appopt_identity "$APP_OPT_PID" "$PROCESS_START" "$BOOT_ID"
 		fi
 	done
-	rm -f "$PID_FILE"
+	rm -f "$PID_FILE" "$MODDIR/AppOpt.pid"
 }
 
 wait_sys_boot_completed() {
@@ -119,9 +126,10 @@ remove_own_pid_record() {
 }
 
 stop_previous_watchdog() {
-	[ -r "$WATCHDOG_FILE" ] || return 0
+	local record_file=${1:-$WATCHDOG_FILE}
+	[ -r "$record_file" ] || return 0
 	local old_pid old_start old_boot old_extra remaining
-	IFS=' ' read -r old_pid old_start old_boot old_extra < "$WATCHDOG_FILE"
+	IFS=' ' read -r old_pid old_start old_boot old_extra < "$record_file"
 	[ -z "$old_extra" ] && identity_is_alive "$old_pid" "$old_start" "$old_boot" || return 0
 	kill "$old_pid" 2>/dev/null || return 1
 	remaining=8
@@ -176,7 +184,7 @@ stop_owned_child() {
 
 start_appopt() {
 	prepare_log || return 1
-	LOG_PIPE="$MODDIR/.AppOpt.log.$$"
+	LOG_PIPE="$RUNDIR/.AppOpt.log.$$"
 	rm -f "$LOG_PIPE"
 	if ! mkfifo "$LOG_PIPE"; then
 		log_start_event "cannot create startup log pipe"
@@ -254,20 +262,61 @@ watchdog_cleanup() {
 	fi
 }
 
-WATCHDOG_FILE="$MODDIR/.AppOpt.watchdog.pid"
 [ -n "$BOOT_ID" ] || exit 1
+[ ! -L "$RUNDIR" ] && mkdir -p "$RUNDIR" &&
+	[ -d "$RUNDIR" ] && [ ! -L "$RUNDIR" ] && chmod 0700 "$RUNDIR" || exit 1
 if [ "$1" != "--watchdog" ]; then
 	wait_sys_boot_completed
 	module_is_enabled || exit 0
-	if [ "$KSU_LATE_LOAD" = "1" ]; then stop_previous_watchdog; fi
-	exec 9>> "$MODDIR/.AppOpt.service.lock" || exit 1
+	if [ "$KSU_LATE_LOAD" = "1" ]; then
+		stop_previous_watchdog
+		stop_previous_watchdog "$MODDIR/.AppOpt.watchdog.pid"
+	else
+		# A visible old watchdog must finish before changing its lock layout.
+		if [ -r "$MODDIR/.AppOpt.watchdog.pid" ]; then
+			IFS=' ' read -r old_pid old_start old_boot old_extra < "$MODDIR/.AppOpt.watchdog.pid"
+			if [ -z "$old_extra" ] && identity_is_alive "$old_pid" "$old_start" "$old_boot"; then exit 0; fi
+		fi
+		if read_pid_record "$MODDIR/AppOpt.pid"; then exit 0; fi
+	fi
+	[ ! -L "$RUNDIR/AppOpt.service.lock" ] || exit 1
+	exec 9>> "$RUNDIR/AppOpt.service.lock" || exit 1
 	"$MODDIR/AppOpt" --acquire-service-lock
 	LOCK_STATUS=$?
 	[ "$LOCK_STATUS" -eq 73 ] && exit 0
 	[ "$LOCK_STATUS" -eq 0 ] || exit 1
 	if [ "$KSU_LATE_LOAD" = "1" ]; then stop_late_load_instance; fi
+	# Keep old lock inodes locked while migrating; never delete an active lock.
+	if [ -e "$RUNDIR/legacy.AppOpt.service.lock" ]; then
+		[ ! -L "$RUNDIR/legacy.AppOpt.service.lock" ] || exit 1
+		exec 6>> "$RUNDIR/legacy.AppOpt.service.lock" || exit 1
+		"$MODDIR/AppOpt" --acquire-service-lock 9>&6 || exit 0
+	fi
+	if [ -e "$MODDIR/.AppOpt.service.lock" ]; then
+		[ ! -L "$MODDIR/.AppOpt.service.lock" ] || exit 1
+		exec 7>> "$MODDIR/.AppOpt.service.lock" || exit 1
+		"$MODDIR/AppOpt" --acquire-service-lock 9>&7 || exit 0
+		mv -f "$MODDIR/.AppOpt.service.lock" "$RUNDIR/legacy.AppOpt.service.lock" || exit 1
+	fi
+	for old_log in AppOpt.log AppOpt.log.prev; do
+		[ -f "$MODDIR/$old_log" ] || continue
+		if [ ! -e "$RUNDIR/$old_log" ]; then
+			mv "$MODDIR/$old_log" "$RUNDIR/$old_log" || exit 1
+		else
+			rm -f "$MODDIR/$old_log"
+		fi
+	done
+	rm -f "$MODDIR/AppOpt.pid" "$MODDIR/.AppOpt.watchdog.pid"
+	for old_pipe in "$MODDIR"/.AppOpt.log.*; do
+		[ ! -p "$old_pipe" ] || rm -f "$old_pipe"
+	done
+	for old_record in "$MODDIR"/AppOpt.pid.* "$MODDIR"/.AppOpt.watchdog.pid.*; do
+		old_suffix=${old_record##*.}
+		case "$old_suffix" in ''|*[!0-9]*) continue ;; esac
+		[ ! -f "$old_record" ] || rm -f "$old_record"
+	done
 	# The child retains fd 9 while this startup shell returns to the Root manager.
-	nohup /system/bin/sh "$MODDIR/service.sh" --watchdog >/dev/null 2>&1 &
+	nohup /system/bin/sh "$MODDIR/service.sh" --watchdog 6>&- 7>&- >/dev/null 2>&1 &
 	exit 0
 fi
 
